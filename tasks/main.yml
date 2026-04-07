@@ -1,0 +1,4 @@
+---
+# This role provides the ipa_certmonger module.
+# Include this role in your play to make the module available.
+# No tasks are executed — the module is loaded from library/.

@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: Oddly
+  description: Ansible module for requesting TLS certificates from FreeIPA CA via certmonger
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - freeipa
+    - certmonger
+    - tls
+    - certificates
+    - security
+dependencies: []
