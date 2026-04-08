@@ -19,19 +19,39 @@ Ansible module for requesting and managing TLS certificates from FreeIPA CA via 
 - FreeIPA-enrolled host (`ipa-client-install`)
 - certmonger installed and running
 - Base64-encoded Kerberos keytab for the certificate admin principal
-- For VIP support: VIP hosts and services pre-created by an IPA admin (see [VIP Setup](#vip-setup))
+- For VIP support: [freeipa_vip_setup](https://github.com/Oddly/freeipa_vip_setup) role must have been run first
 
 ## Installation
 
-Copy `library/ipa_certmonger.py` into the `library/` directory of your Ansible playbook or role:
+Add to your `requirements.yml`:
 
+```yaml
+- src: https://github.com/Oddly/ipa_certmonger.git
+  scm: git
+  name: ipa_certmonger
+  version: main
 ```
-your_playbook/
-├── library/
-│   └── ipa_certmonger.py
-├── playbooks/
-│   └── certificates.yml
-└── site.yml
+
+Then install:
+
+```bash
+ansible-galaxy install -r requirements.yml
+```
+
+Include the role in any play that uses the module:
+
+```yaml
+- name: My certificates play
+  hosts: myservers
+  roles:
+    - ipa_certmonger
+  tasks:
+    - name: Request certificate
+      ipa_certmonger:
+        service: HTTP
+        cert_dir: /etc/pki/myservice
+        owner: root
+        keytab: "{{ vault_certadmin_keytab }}"
 ```
 
 ## Usage
@@ -104,6 +124,20 @@ The module will:
 - Create `managedBy` associations in FreeIPA for each VIP DNS name
 - Validate the `vip_records` structure before making any changes
 
+### Without VIP (simple certificate)
+
+```yaml
+- name: Request certificate for Kibana
+  ipa_certmonger:
+    service: HTTP
+    cert_dir: /etc/pki/kibana
+    owner: root
+    shortname: false
+    keytab: "{{ vault_certadmin_keytab }}"
+```
+
+No `vip_records` needed — just a simple certificate with the host FQDN as SAN.
+
 ## Parameters
 
 | Parameter | Required | Default | Description |
@@ -127,7 +161,7 @@ The module will:
 
 ## VIP Records Structure
 
-The `vip_records` parameter accepts a list of dictionaries, each representing a VIP endpoint:
+The `vip_records` parameter accepts a list of dictionaries, each representing a VIP endpoint. This is the same structure used by the [freeipa_vip_setup](https://github.com/Oddly/freeipa_vip_setup) role.
 
 ```yaml
 vip_records:
@@ -139,12 +173,10 @@ vip_records:
     reverse_dns_name: haproxy-vip.example.com  # Required when include_ip_in_cert is true
 ```
 
-### Fields
-
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `dns_names` | yes | | List of DNS names (become DNS SANs + managedBy associations) |
-| `ip` | yes | | VIP IP address (used for A-records, optionally as IP SAN) |
+| `ip` | yes | | VIP IP address (optionally used as IP SAN) |
 | `include_ip_in_cert` | no | `false` | Whether to add the IP as an IP SAN in the certificate |
 | `reverse_dns_name` | when `include_ip_in_cert` is true | | DNS name for the PTR record; must be present in `dns_names` |
 
@@ -155,46 +187,13 @@ vip_records:
 - When `include_ip_in_cert` is true, `reverse_dns_name` is required and must be present in `dns_names`
 - FreeIPA requires a PTR record for each IP SAN; only one PTR is possible per IP, hence the explicit `reverse_dns_name`
 
-## VIP Setup
+## VIP Prerequisites
 
-Before using `vip_records`, the following must be set up once per environment by an IPA admin:
+Before using `vip_records`, the required FreeIPA objects (DNS records, dummy hosts, service principals, permissions) must exist. Use the [freeipa_vip_setup](https://github.com/Oddly/freeipa_vip_setup) role to create them automatically.
 
-```bash
-# For each DNS name in vip_records:
+The `freeipa_vip_setup` role can be run standalone or integrated into your playbook via `delegate_to`. See its README for details.
 
-# 1. DNS A-record
-ipa dnsrecord-add example.com haproxy-vip --a-rec=10.0.0.100
-
-# 2. DNS PTR-record (only for the reverse_dns_name, one per IP)
-ipa dnsrecord-add <reverse-zone> <reverse-octets> --ptr-rec=haproxy-vip.example.com.
-
-# 3. Dummy host (no enrollment needed)
-ipa host-add haproxy-vip.example.com --force
-
-# 4. Service principal
-ipa service-add HTTP/haproxy-vip.example.com --force
-
-# 5. Permission for the keytab principal to manage managedBy
-ipa permission-add "Manage haproxy-vip managedBy" \
-    --right=write --attrs=managedby \
-    --subtree="krbprincipalname=HTTP/haproxy-vip.example.com@EXAMPLE.COM,cn=services,cn=accounts,dc=example,dc=com"
-
-# 6. Privilege (once, reuse for all VIPs)
-ipa privilege-add "Service Host Management" \
-    --desc="Manage managedBy for VIP services"
-
-# 7. Attach permission to privilege
-ipa privilege-add-permission "Service Host Management" \
-    --permissions="Manage haproxy-vip managedBy"
-
-# 8. Attach privilege to the keytab principal's role (once)
-ipa role-add-privilege "<CERTADMIN_ROLE>" \
-    --privileges="Service Host Management"
-```
-
-Steps 6 and 8 are one-time only. For each additional VIP DNS name, repeat steps 1-5 and 7.
-
-The module automatically handles per-host `managedBy` associations (`ipa service-add-host`) on each run.
+If the VIP prerequisites are missing, the module will fail with a clear error message showing exactly what needs to be created.
 
 ## Drift Detection
 
@@ -225,22 +224,11 @@ When drift is detected, the module automatically:
 
 The module provides detailed, actionable error messages for every failure:
 
-- **VIP service not found**: shows the exact `ipa host-add` and `ipa service-add` commands needed
+- **VIP service not found**: shows the exact `ipa host-add` and `ipa service-add` commands needed, or suggests running `freeipa_vip_setup`
 - **Insufficient access**: identifies which permission is missing and shows the `ipa permission-add` command
 - **Certificate rejected**: extracts the CA error from certmonger and distinguishes permanent from temporary failures
 - **Kinit failures**: shows the principal and original Kerberos error
 - **Invalid configuration**: pinpoints the exact `vip_records` entry and field with the problem
-
-## Testing
-
-Run the unit tests:
-
-```bash
-pip install pytest ansible-core
-pytest tests/test_ipa_certmonger.py -v
-```
-
-All IPA/certmonger/OS interactions are mocked — no FreeIPA or certmonger needed to run tests.
 
 ## How It Works
 
@@ -271,6 +259,47 @@ All IPA/certmonger/OS interactions are mocked — no FreeIPA or certmonger neede
 │  - Runs post_save command after renewal          │
 └─────────────────────────────────────────────────┘
 ```
+
+## Relationship with freeipa_vip_setup
+
+The [freeipa_vip_setup](https://github.com/Oddly/freeipa_vip_setup) role creates the FreeIPA prerequisites. This module then uses them:
+
+```
+freeipa_vip_setup (once, as IPA admin)         ipa_certmonger (each deploy, as certadmin)
+──────────────────────────────────────         ──────────────────────────────────────────
+DNS A-records                                  (reads dns_names as SANs)
+DNS PTR-record                                 (enables IP SAN validation)
+Dummy hosts                                    (required for service principals)
+Service principals                             (required for managedBy)
+managedBy permissions                      ->  service-add-host (per host)
+Privilege + role for certadmin                 (enables service-add-host)
+```
+
+Both consume the same `freeipa_vip_records` variable structure.
+
+## Directory Structure
+
+```
+ipa_certmonger/
+├── library/
+│   └── ipa_certmonger.py      # The Ansible module
+├── meta/
+│   └── main.yml               # Role metadata (for ansible-galaxy)
+├── tasks/
+│   └── main.yml               # Empty (module loaded from library/)
+├── tests/
+│   └── test_ipa_certmonger.py # Unit tests (47 tests, all mocked)
+└── README.md
+```
+
+## Testing
+
+```bash
+pip install pytest ansible-core
+pytest tests/test_ipa_certmonger.py -v
+```
+
+All IPA/certmonger/OS interactions are mocked — no FreeIPA or certmonger needed to run tests.
 
 ## License
 
