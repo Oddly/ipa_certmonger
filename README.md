@@ -124,6 +124,37 @@ The module will:
 - Create `managedBy` associations in FreeIPA for each VIP DNS name
 - Validate the `vip_records` structure before making any changes
 
+### Remove certificate tracking and files
+
+```yaml
+- name: Remove certificate
+  ipa_certmonger:
+    service: HTTP
+    cert_dir: /etc/pki/elasticsearch
+    owner: root
+    state: absent
+```
+
+When `state: absent`, the module:
+- Stops certmonger tracking
+- Removes the certificate and key files
+- Removes managedBy associations (if `keytab` and `vip_records` are provided)
+- Service principals are NOT removed (they may be used by other hosts)
+
+### Force certificate re-request
+
+```yaml
+- name: Force re-request (e.g. after compromise)
+  ipa_certmonger:
+    service: HTTP
+    cert_dir: /etc/pki/elasticsearch
+    owner: root
+    force: true
+    keytab: "{{ vault_certadmin_keytab }}"
+```
+
+Use `force: true` when the certificate must be replaced even though no drift is detected (e.g. after a private key compromise).
+
 ### Without VIP (simple certificate)
 
 ```yaml
@@ -158,6 +189,8 @@ No `vip_records` needed — just a simple certificate with the host FQDN as SAN.
 | `keytab` | no | | Base64-encoded Kerberos keytab (required for new requests) |
 | `keytab_principal` | no | `certadmin` | Kerberos principal for kinit |
 | `profile` | no | | FreeIPA certificate profile |
+| `state` | no | `present` | `present` (request/track) or `absent` (stop tracking, remove files) |
+| `force` | no | `false` | Force re-request even without drift (e.g. after key compromise) |
 
 ## VIP Records Structure
 
@@ -200,12 +233,16 @@ If the VIP prerequisites are missing, the module will fail with a clear error me
 When a certificate is already tracked by certmonger, the module checks for configuration drift:
 
 - **post_save changes** — detects if the post-renewal command has changed
-- **SAN changes** — detects missing DNS or IP SANs (e.g. when VIP records are added)
+- **Missing SANs** — detects DNS or IP SANs that should be in the cert but aren't (e.g. when VIP records are added)
+- **Extra SANs** — detects DNS or IP SANs that are in the cert but shouldn't be (e.g. when VIP records are removed)
+- **Profile changes** — detects if the certificate profile has changed
 
 When drift is detected, the module automatically:
 1. Warns about the specific drift
 2. Stops tracking of the current certificate
 3. Re-requests the certificate with the desired configuration
+
+Use `force: true` to re-request even when no drift is detected.
 
 ## Return Values
 
