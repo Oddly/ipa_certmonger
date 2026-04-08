@@ -135,6 +135,25 @@ options:
       - Use a profile with short validity for test/renewal verification.
     required: false
     type: str
+  state:
+    description:
+      - Whether the certificate should be present (tracked) or absent (untracked).
+      - When absent, certmonger tracking is stopped and the certificate and key
+        files are removed.
+      - Service principals and managedBy associations are NOT removed (they may
+        be shared with other hosts).
+    required: false
+    type: str
+    default: present
+    choices: [present, absent]
+  force:
+    description:
+      - Force certificate re-request even when no drift is detected.
+      - Use when a certificate is compromised and must be replaced.
+      - Has no effect when state is absent.
+    required: false
+    type: bool
+    default: false
 '''
 
 EXAMPLES = r'''
@@ -183,6 +202,21 @@ EXAMPLES = r'''
         ip: "10.0.0.100"
         include_ip_in_cert: true
         reverse_dns_name: haproxy-vip.example.com
+    keytab: "{{ vault_certadmin_keytab }}"
+
+- name: Remove certificate tracking and files
+  ipa_certmonger:
+    service: HTTP
+    cert_dir: /etc/pki/elasticsearch
+    owner: root
+    state: absent
+
+- name: Force certificate re-request (e.g. after compromise)
+  ipa_certmonger:
+    service: HTTP
+    cert_dir: /etc/pki/elasticsearch
+    owner: root
+    force: true
     keytab: "{{ vault_certadmin_keytab }}"
 '''
 
@@ -295,6 +329,22 @@ def validate_fqdn(module, fqdn):
         )
 
 
+def validate_file_mode(module, value, param_name):
+    """Validate that a file mode string is valid octal."""
+    try:
+        mode = int(value, 8)
+    except ValueError:
+        module.fail_json(
+            msg="'%s' value '%s' is not a valid octal mode. "
+                "Use a string like '0640' or '0600'." % (param_name, value)
+        )
+    if mode > 0o7777 or mode < 0:
+        module.fail_json(
+            msg="'%s' value '%s' is out of range for a file mode."
+                % (param_name, value)
+        )
+
+
 def validate_vip_records(module, vip_records, result):
     """Validate the structure of vip_records with clear error messages."""
     for i, record in enumerate(vip_records):
@@ -404,6 +454,10 @@ def parse_tracking_info(status_output):
             info['dns_sans'].append(line.split(':', 1)[1].strip())
         elif line.startswith('ip-address:'):
             info['ip_sans'].append(line.split(':', 1)[1].strip())
+        elif line.startswith('ca-name:'):
+            info['ca_name'] = line.split(':', 1)[1].strip()
+        elif line.startswith('profile:'):
+            info['profile'] = line.split(':', 1)[1].strip()
     return info
 
 
@@ -479,7 +533,7 @@ def wait_for_certificate(module, getcert_bin, cert_file, timeout, result):
 # Directory and SELinux
 # ---------------------------------------------------------------------------
 
-def ensure_directory(module, path, group, result):
+def ensure_directory(module, path, owner, group, result):
     """Ensure the certificate directory exists with correct permissions."""
     changed = False
 
@@ -502,7 +556,7 @@ def ensure_directory(module, path, group, result):
         changed = True
 
     try:
-        uid = pwd.getpwnam('root').pw_uid
+        uid = pwd.getpwnam(owner).pw_uid
         gid = grp_mod.getgrnam(group).gr_gid
     except KeyError as e:
         module.fail_json(
@@ -595,7 +649,7 @@ def kinit_from_keytab(module, keytab_b64, principal, result):
         )
 
     rc, stdout, stderr = module.run_command(
-        ['kinit', '-p', principal, '-t', keytab_path]
+        ['kinit', '-k', '-t', keytab_path, principal]
     )
     if rc != 0:
         os.unlink(keytab_path)
@@ -669,6 +723,49 @@ def extract_vip_sans(vip_records):
             if ip and ip not in sans:
                 sans.append(ip)
     return sans
+
+
+def remove_vip_managed_by(module, service, fqdn, vip_records, result):
+    """Remove managedBy associations for this host from all VIP services.
+
+    Called during state=absent to clean up the host's relationship to
+    VIP service principals. The service principals themselves are NOT
+    removed (they may be used by other hosts).
+    """
+    removed = []
+    for record in vip_records:
+        for dns_name in record.get('dns_names', []):
+            principal = '%s/%s' % (service, dns_name)
+
+            # Check if managedBy is set for this host
+            rc, stdout, stderr = module.run_command(
+                ['ipa', 'service-show', principal]
+            )
+            if rc != 0:
+                # Service doesn't exist — nothing to clean up
+                continue
+
+            managed_hosts = [
+                h.strip() for line in stdout.splitlines()
+                for h in line.split(':')[1:]
+                if line.strip().startswith('Managed by')
+            ]
+            if fqdn not in managed_hosts:
+                continue
+
+            rc, stdout, stderr = module.run_command(
+                ['ipa', 'service-remove-host',
+                 '--hosts=%s' % fqdn, principal]
+            )
+            if rc != 0 and 'not a member' not in stderr.lower():
+                module.warn(
+                    "Could not remove managedBy for '%s' from '%s': %s"
+                    % (fqdn, principal, stderr.strip())
+                )
+            else:
+                removed.append(principal)
+
+    return removed
 
 
 def ensure_vip_managed_by(module, service, fqdn, vip_records, result):
@@ -824,6 +921,11 @@ def main():
                 type='str', required=False, default='certadmin'
             ),
             profile=dict(type='str', required=False, default=None),
+            state=dict(
+                type='str', required=False, default='present',
+                choices=['present', 'absent'],
+            ),
+            force=dict(type='bool', required=False, default=False),
         ),
         supports_check_mode=True,
     )
@@ -857,8 +959,21 @@ def main():
 
     # --- Validation ---
 
-    if vip_records:
-        validate_vip_records(module, vip_records, result)
+    if module.params['state'] == 'present':
+        validate_file_mode(module, cert_mode, 'cert_mode')
+        validate_file_mode(module, key_mode, 'key_mode')
+
+        if post_save:
+            post_save_cmd = post_save.split()[0]
+            if not module.get_bin_path(post_save_cmd):
+                module.warn(
+                    "post_save command '%s' was not found on PATH. "
+                    "Certmonger will fail silently after certificate renewal "
+                    "if this command does not exist." % post_save_cmd
+                )
+
+        if vip_records:
+            validate_vip_records(module, vip_records, result)
 
     if not os.path.exists('/etc/ipa/default.conf'):
         module.fail_json(
@@ -879,6 +994,75 @@ def main():
                 % stdout.strip(),
             **result
         )
+
+    state = module.params['state']
+    force = module.params['force']
+
+    # --- State: absent ---
+
+    if state == 'absent':
+        tracked, status_output = get_cert_status(
+            module, getcert_bin, cert_file
+        )
+        has_files = os.path.isfile(cert_file) or os.path.isfile(key_file)
+        has_vip_cleanup = bool(vip_records) and bool(
+            module.params.get('keytab')
+        )
+
+        if not tracked and not has_files and not has_vip_cleanup:
+            result['msg'] = 'Certificate is not tracked and files do not exist'
+            module.exit_json(**result)
+
+        if module.check_mode:
+            result['changed'] = True
+            parts = []
+            if tracked:
+                parts.append('stop tracking')
+            if has_files:
+                parts.append('remove cert/key files')
+            if has_vip_cleanup:
+                parts.append('remove managedBy associations')
+            result['msg'] = (
+                'Certificate would be removed (check mode): %s'
+                % ', '.join(parts)
+            )
+            module.exit_json(**result)
+
+        result['changed'] = True
+        actions = []
+
+        if tracked:
+            module.run_command(
+                [getcert_bin, 'stop-tracking', '-f', cert_file]
+            )
+            actions.append('Stopped certmonger tracking for %s' % cert_file)
+
+        for path in (cert_file, key_file):
+            if os.path.isfile(path):
+                os.unlink(path)
+                actions.append('Removed %s' % path)
+
+        # Remove managedBy associations if keytab + vip_records provided
+        if has_vip_cleanup:
+            keytab = module.params['keytab']
+            keytab_principal = module.params['keytab_principal']
+            keytab_path = kinit_from_keytab(
+                module, keytab, keytab_principal, result
+            )
+            try:
+                removed = remove_vip_managed_by(
+                    module, service, fqdn, vip_records, result
+                )
+                for principal in removed:
+                    actions.append(
+                        'Removed managedBy %s from %s' % (fqdn, principal)
+                    )
+            finally:
+                kerberos_cleanup(module, keytab_path)
+
+        result['actions'] = actions
+        result['msg'] = 'Certificate tracking stopped and files removed'
+        module.exit_json(**result)
 
     # --- Check existing tracking ---
 
@@ -929,16 +1113,42 @@ def main():
             current_ips = sorted(set(tracking.get('ip_sans', [])))
 
             missing_dns = set(desired_dns) - set(current_dns)
+            extra_dns = set(current_dns) - set(desired_dns)
             missing_ips = set(desired_ips) - set(current_ips)
+            extra_ips = set(current_ips) - set(desired_ips)
             if missing_dns:
                 drift.append(
                     'Missing DNS SANs in current cert: %s'
                     % ', '.join(sorted(missing_dns))
                 )
+            if extra_dns:
+                drift.append(
+                    'Extra DNS SANs in current cert: %s'
+                    % ', '.join(sorted(extra_dns))
+                )
             if missing_ips:
                 drift.append(
                     'Missing IP SANs in current cert: %s'
                     % ', '.join(sorted(missing_ips))
+                )
+            if extra_ips:
+                drift.append(
+                    'Extra IP SANs in current cert: %s'
+                    % ', '.join(sorted(extra_ips))
+                )
+
+            # Profile drift
+            profile = module.params.get('profile')
+            current_profile = tracking.get('profile', '') or ''
+            if profile and current_profile != profile:
+                drift.append(
+                    'profile: expected=%s, current=%s'
+                    % (profile, current_profile or '<none>')
+                )
+            elif not profile and current_profile:
+                drift.append(
+                    'profile: expected=<default>, current=%s'
+                    % current_profile
                 )
 
             if drift:
@@ -954,10 +1164,25 @@ def main():
                 tracked = False
                 # Fall through to the request flow below
 
+            if tracked and force:
+                module.warn(
+                    'force=true: stopping tracking and re-requesting '
+                    'certificate for %s' % fqdn
+                )
+                module.run_command(
+                    [getcert_bin, 'stop-tracking', '-f', cert_file]
+                )
+                tracked = False
+
             if tracked:
                 result['msg'] = (
                     'Certificate is already tracked by certmonger'
                 )
+                result['sans'] = tracking.get('dns_sans', []) + tracking.get('ip_sans', [])
+                if tracking.get('post_save'):
+                    result['post_save'] = tracking['post_save']
+                if tracking.get('profile'):
+                    result['profile'] = tracking['profile']
                 module.exit_json(**result)
 
     # --- Validate extra_sans IPs ---
@@ -968,13 +1193,16 @@ def main():
 
     result['changed'] = True
 
-    # Build SAN list (also for check_mode output)
+    # Build SAN list (also for check_mode output), preserving order
     sans = [fqdn]
-    if include_shortname:
+    if include_shortname and short not in sans:
         sans.append(short)
-    sans.extend(extra_sans)
-    vip_sans = extract_vip_sans(vip_records)
-    sans.extend(vip_sans)
+    for san in extra_sans:
+        if san not in sans:
+            sans.append(san)
+    for san in extract_vip_sans(vip_records):
+        if san not in sans:
+            sans.append(san)
     result['sans'] = sans
 
     if module.check_mode:
@@ -996,7 +1224,7 @@ def main():
         )
 
     # Create directory / fix permissions
-    ensure_directory(module, cert_dir, group, result)
+    ensure_directory(module, cert_dir, owner, group, result)
 
     # Track actions performed (for diff output)
     actions = []
