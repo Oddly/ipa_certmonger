@@ -594,10 +594,86 @@ class TestParseTrackingInfo:
         assert '10.0.0.1' in info['ip_sans']
         assert '10.0.0.100' in info['ip_sans']
 
+    def test_dns_sans_comma_separated(self):
+        info = mod.parse_tracking_info(
+            '\tdns: host.example.com,vip1.example.com,vip2.example.com'
+        )
+        assert info['dns_sans'] == [
+            'host.example.com', 'vip1.example.com', 'vip2.example.com'
+        ]
+
+    def test_ip_sans_comma_separated(self):
+        info = mod.parse_tracking_info(
+            '\tip-address: 10.0.0.1,10.0.0.100'
+        )
+        assert info['ip_sans'] == ['10.0.0.1', '10.0.0.100']
+
     def test_empty(self):
         info = mod.parse_tracking_info('')
         assert info['dns_sans'] == []
         assert info['ip_sans'] == []
+
+    def test_dns_comma_with_whitespace(self):
+        info = mod.parse_tracking_info(
+            '\tdns: host.example.com , vip.example.com '
+        )
+        assert info['dns_sans'] == ['host.example.com', 'vip.example.com']
+
+    def test_empty_entries_in_comma_list(self):
+        info = mod.parse_tracking_info(
+            '\tdns: host.example.com,,vip.example.com,'
+        )
+        assert info['dns_sans'] == ['host.example.com', 'vip.example.com']
+
+    def test_profile_and_ca_name(self):
+        info = mod.parse_tracking_info(
+            '\tca-name: IPA\n'
+            '\tprofile: caIPAserviceCert'
+        )
+        assert info['ca_name'] == 'IPA'
+        assert info['profile'] == 'caIPAserviceCert'
+
+
+# ---------------------------------------------------------------------------
+# Tests: parse_cert_ip_sans
+# ---------------------------------------------------------------------------
+
+class TestParseCertIpSans:
+    def test_single_ip(self):
+        module = MagicMock()
+        module.run_command.return_value = (0, """
+            X509v3 Subject Alternative Name:
+                DNS:host.example.com, IP Address:10.0.0.1
+        """, '')
+        assert mod.parse_cert_ip_sans(module, '/tmp/test.crt') == ['10.0.0.1']
+
+    def test_multiple_ips(self):
+        module = MagicMock()
+        module.run_command.return_value = (0, """
+            X509v3 Subject Alternative Name:
+                DNS:host.example.com, IP Address:10.0.0.1, IP Address:10.0.0.2
+        """, '')
+        result = mod.parse_cert_ip_sans(module, '/tmp/test.crt')
+        assert '10.0.0.1' in result
+        assert '10.0.0.2' in result
+
+    def test_no_san(self):
+        module = MagicMock()
+        module.run_command.return_value = (0, "some cert text without SAN", '')
+        assert mod.parse_cert_ip_sans(module, '/tmp/test.crt') == []
+
+    def test_openssl_failure(self):
+        module = MagicMock()
+        module.run_command.return_value = (1, '', 'error')
+        assert mod.parse_cert_ip_sans(module, '/tmp/test.crt') == []
+
+    def test_dns_only(self):
+        module = MagicMock()
+        module.run_command.return_value = (0, """
+            X509v3 Subject Alternative Name:
+                DNS:host.example.com, DNS:vip.example.com
+        """, '')
+        assert mod.parse_cert_ip_sans(module, '/tmp/test.crt') == []
 
 
 # ---------------------------------------------------------------------------

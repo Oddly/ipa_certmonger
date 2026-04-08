@@ -451,14 +451,43 @@ def parse_tracking_info(status_output):
         if line.startswith('post-save command:'):
             info['post_save'] = line.split(':', 1)[1].strip()
         elif line.startswith('dns:'):
-            info['dns_sans'].append(line.split(':', 1)[1].strip())
+            value = line.split(':', 1)[1].strip()
+            info['dns_sans'].extend(
+                s.strip() for s in value.split(',') if s.strip()
+            )
         elif line.startswith('ip-address:'):
-            info['ip_sans'].append(line.split(':', 1)[1].strip())
+            value = line.split(':', 1)[1].strip()
+            info['ip_sans'].extend(
+                s.strip() for s in value.split(',') if s.strip()
+            )
         elif line.startswith('ca-name:'):
             info['ca_name'] = line.split(':', 1)[1].strip()
         elif line.startswith('profile:'):
             info['profile'] = line.split(':', 1)[1].strip()
     return info
+
+
+def parse_cert_ip_sans(module, cert_file):
+    """Extract IP SANs from the actual certificate using openssl."""
+    rc, stdout, stderr = module.run_command(
+        ['openssl', 'x509', '-in', cert_file, '-noout', '-text']
+    )
+    if rc != 0:
+        return []
+    ips = []
+    in_san = False
+    for line in stdout.splitlines():
+        line = line.strip()
+        if 'Subject Alternative Name' in line:
+            in_san = True
+            continue
+        if in_san:
+            for part in line.split(','):
+                part = part.strip()
+                if part.startswith('IP Address:'):
+                    ips.append(part.split(':', 1)[1].strip())
+            break
+    return ips
 
 
 def wait_for_certificate(module, getcert_bin, cert_file, timeout, result):
@@ -813,8 +842,11 @@ def ensure_vip_managed_by(module, service, fqdn, vip_records, result):
                 ['ipa', 'service-add-host',
                  '--hosts=%s' % fqdn, principal]
             )
+            # IPA reports "already a member" in stdout (not stderr) with rc=1
+            if rc != 0 and 'already a member' in stdout.lower():
+                continue
             if rc != 0:
-                ipa_error = stderr.strip()
+                ipa_error = stderr.strip() or stdout.strip()
                 if 'Insufficient access' in ipa_error:
                     hint = (
                         "The '%s' principal does not have write permission "
@@ -878,6 +910,35 @@ def request_certificate(module, getcert_bin, params, result):
         cmd.extend(['-T', params['profile']])
 
     rc, stdout, stderr = module.run_command(cmd)
+
+    # Handle stale tracking: certmonger may still track a request for this
+    # file path even though get_cert_status could not find it (e.g. after
+    # the cert file was deleted externally).  Stop by nickname (-i) since
+    # stop-tracking by file (-f) can fail when the file is missing.
+    if rc != 0 and 'already used by request' in stdout:
+        import re
+        nick_match = re.search(r'nickname "([^"]+)"', stdout)
+        if nick_match:
+            nickname = nick_match.group(1)
+            module.warn(
+                'Stale certmonger request "%s" detected for %s. '
+                'Stopping old tracking and retrying.'
+                % (nickname, params['cert_file'])
+            )
+            module.run_command(
+                [getcert_bin, 'stop-tracking', '-i', nickname]
+            )
+        else:
+            module.warn(
+                'Stale certmonger request detected for %s. '
+                'Stopping old tracking and retrying.'
+                % params['cert_file']
+            )
+            module.run_command(
+                [getcert_bin, 'stop-tracking', '-f', params['cert_file']]
+            )
+        rc, stdout, stderr = module.run_command(cmd)
+
     if rc != 0:
         dns_sans = [s for s in params['sans'] if not is_ip(s)]
         ip_sans = [s for s in params['sans'] if is_ip(s)]
@@ -1110,7 +1171,13 @@ def main():
                 s for s in desired_sans if is_ip(s)
             ))
             current_dns = sorted(set(tracking.get('dns_sans', [])))
+            # certmonger's ipa-getcert list may not report IP SANs;
+            # fall back to reading them from the actual certificate.
             current_ips = sorted(set(tracking.get('ip_sans', [])))
+            if not current_ips and desired_ips and os.path.isfile(cert_file):
+                current_ips = sorted(set(
+                    parse_cert_ip_sans(module, cert_file)
+                ))
 
             missing_dns = set(desired_dns) - set(current_dns)
             extra_dns = set(current_dns) - set(desired_dns)
@@ -1161,6 +1228,12 @@ def main():
                 module.run_command(
                     [getcert_bin, 'stop-tracking', '-f', cert_file]
                 )
+                # Remove existing cert and key so certmonger generates
+                # a fresh key pair and CSR.  Without this, certmonger
+                # reuses the old key and CSR which may lack new SANs.
+                for path in (cert_file, key_file):
+                    if os.path.exists(path):
+                        os.unlink(path)
                 tracked = False
                 # Fall through to the request flow below
 
@@ -1172,6 +1245,9 @@ def main():
                 module.run_command(
                     [getcert_bin, 'stop-tracking', '-f', cert_file]
                 )
+                for path in (cert_file, key_file):
+                    if os.path.exists(path):
+                        os.unlink(path)
                 tracked = False
 
             if tracked:
